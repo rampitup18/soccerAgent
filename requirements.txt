@@ -1,0 +1,9 @@
+# Runtime dependencies.
+#
+# The data loader (Commit 1) intentionally uses only the Python standard
+# library, so nothing here is required just to fetch and cache matches.
+# These are pinned loosely for the analysis + visualization work that
+# later commits build on top of the cached event data.
+matplotlib>=3.5
+mplsoccer>=1.1
+numpy>=1.21

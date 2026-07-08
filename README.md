@@ -19,6 +19,11 @@ Built up commit by commit. Current layers:
   description, pydantic input schema, `run`) with an introspectable registry —
   the agent's action space. First tool: an **xG timeline** giving each team's
   per-minute cumulative expected-goals curve.
+- **Commit 3 — Tool executor.** A thin in-process executor that looks up a
+  named tool, validates its arguments, runs it, and always returns a structured
+  `ExecutionResult` — a clean result or an informative, model-readable error
+  (unknown tool, invalid arguments, no match, execution error). Never crashes,
+  so a stochastic agent can read the error and recover.
 
 ## Data source
 
@@ -57,9 +62,12 @@ touchline/
   tools/
     base.py          # Tool contract, ToolResult, ToolRegistry
     xg_timeline.py   # first tool: per-minute cumulative xG per team
+  agent/
+    executor.py      # runs a named tool with validated args -> ExecutionResult
 scripts/
   load_match.py         # CLI: fetch/cache a match and print a summary
   check_xg_timeline.py  # verify the xG tool against hand-computed totals
+  check_executor.py     # verify the executor never crashes on bad calls
 data_cache/          # local JSON cache (gitignored, safe to delete)
 ```
 

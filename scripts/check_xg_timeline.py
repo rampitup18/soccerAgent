@@ -3,12 +3,13 @@
 
 Checks, on the 2022 World Cup Final:
 
-* the tool's per-team totals equal a straight sum of shot xGs (computed here
-  from the raw events, not via the tool);
+* the tool's per-team totals equal a straight sum of run-of-play shot xGs
+  (computed here from the raw events, not via the tool);
 * every cumulative curve is monotonically non-decreasing (cumulative xG can
   never fall) and ends exactly at the team's total;
 * the series is on a per-minute grid;
-* the penalty shootout is excluded by default but appears when requested.
+* the penalty shootout is excluded from the timeline and reported separately,
+  with its own running score (Argentina beat France 4-2).
 """
 
 from __future__ import annotations
@@ -23,13 +24,13 @@ from touchline.data import StatsBombLoader, WC_2022_FINAL  # noqa: E402
 from touchline.tools import REGISTRY  # noqa: E402
 
 
-def hand_totals(events, include_shootout):
-    """Ground truth: sum shot xG straight from the events."""
+def hand_totals(events):
+    """Ground truth: sum run-of-play shot xG straight from the events."""
     totals = defaultdict(float)
     for e in events:
         if e.get("type", {}).get("name") != "Shot":
             continue
-        if not include_shootout and e.get("period") == 5:
+        if e.get("period") == 5:  # shootout: not run-of-play
             continue
         xg = e.get("shot", {}).get("statsbomb_xg")
         if xg is not None:
@@ -47,11 +48,11 @@ def main() -> int:
     def check(cond: bool, label: str) -> None:
         checks.append((bool(cond), label))
 
-    # --- default run (shootout excluded) ---
+    # --- run-of-play timeline (shootout excluded) ---
     res = tool.run(match)
     data = res.data
     teams = data["teams"]
-    truth = hand_totals(match.events, include_shootout=False)
+    truth = hand_totals(match.events)
 
     for t in teams:
         got = data["total_xg"][t]
@@ -80,16 +81,31 @@ def main() -> int:
         "shot_count total matches number of shots",
     )
 
-    # --- shootout inclusion changes the totals ---
-    res_so = tool.run(match, include_shootout=True)
-    truth_so = hand_totals(match.events, include_shootout=True)
-    for t in res_so.data["teams"]:
-        got = res_so.data["total_xg"][t]
-        exp = round(truth_so.get(t, 0.0), 4)
-        check(abs(got - exp) < 1e-6, f"[+shootout] total xG {t}: {got} == {exp}")
+    # --- the shootout is reported separately, on its own terms ---
+    shootout = data["shootout"]
+    check(shootout is not None and shootout["present"], "shootout reported separately")
+    # No shootout kick leaked into the run-of-play shot list.
     check(
-        res_so.data["total_xg"] != data["total_xg"],
-        "including the shootout changes the totals",
+        all(s["period"] != 5 for s in data["shots"]),
+        "no shootout kick appears in the run-of-play timeline",
+    )
+    # Correct final score: Argentina beat France 4-2.
+    check(shootout["score"].get("Argentina") == 4, "shootout: Argentina scored 4")
+    check(shootout["score"].get("France") == 2, "shootout: France scored 2")
+    check(shootout["winner"] == "Argentina", "shootout winner is Argentina")
+    check(len(shootout["kicks"]) == 8, "shootout has 8 kicks")
+    # The shootout's own momentum (running score) only ever climbs.
+    running_ok = True
+    prev = {t: 0 for t in shootout["order"]}
+    for k in shootout["kicks"]:
+        for t in shootout["order"]:
+            if k["score"][t] < prev[t]:
+                running_ok = False
+        prev = k["score"]
+    check(running_ok, "shootout running score is non-decreasing")
+    check(
+        prev == shootout["score"],
+        "shootout running score ends at the final score",
     )
 
     # --- report ---

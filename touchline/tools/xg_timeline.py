@@ -9,24 +9,33 @@ who was on top and when.
 
 StatsBomb ship an xG value on every shot event (``shot.statsbomb_xg``), so the
 timeline computes directly from the shot stream with no modelling of our own.
-The penalty shootout (period 5) is excluded by default: those are not
-run-of-play chances and would swamp the narrative.
+
+**The penalty shootout is not part of this curve.** A shootout is a separate
+contest -- its momentum is a new game, not a continuation of the run of play --
+so folding it into the same cumulative line would imply a continuity that does
+not exist. It is also meaningless in xG terms: StatsBomb assign a flat ~0.78 to
+every shootout penalty regardless of who took it or what happened, so a
+shootout "xG" only measures how many kicks were taken. The timeline therefore
+covers run-of-play (and in-game penalties) only, and the shootout is reported
+*separately*, on its own terms: the running score, which is the momentum that
+actually matters once it starts.
 
 This is Touchline's first tool: a whole-match narrative metric that is trivial
 to verify by hand (each team's final cumulative value is just the sum of its
-shot xGs).
+run-of-play shot xGs).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
 from touchline.data import Match
 from touchline.tools.base import Tool, ToolResult, register
 
-# StatsBomb records the penalty shootout as period 5.
+# StatsBomb records the penalty shootout as period 5. It is a separate contest,
+# never part of the run-of-play xG timeline.
 _SHOOTOUT_PERIOD = 5
 
 
@@ -39,27 +48,25 @@ class XGTimelineInput(BaseModel):
         description="Granularity of the timeline grid, in minutes. 1 gives a "
         "per-minute series.",
     )
-    include_shootout: bool = Field(
-        default=False,
-        description="Include penalty-shootout shots (period 5). Off by "
-        "default: a shootout is not run-of-play xG.",
-    )
 
 
 class XGTimelineTool(Tool):
     name = "xg_timeline"
     description = (
         "Compute each team's cumulative expected goals (xG) over the course of "
-        "the match as a per-minute series. Use this to see momentum swings, "
-        "identify which team created the better chances and when, and quantify "
-        "how the balance of play shifted across phases. Returns both teams' "
-        "cumulative xG curves, per-team totals and shot counts, and the "
-        "individual shots (minute, player, xG, whether it was a goal)."
+        "the match as a per-minute series, covering run of play and in-game "
+        "penalties (the penalty shootout is excluded and reported separately). "
+        "Use this to see momentum swings, identify which team created the "
+        "better chances and when, and quantify how the balance of play shifted "
+        "across phases. Returns both teams' cumulative xG curves, per-team "
+        "totals and shot counts, the individual shots (minute, player, xG, "
+        "whether it was a goal), and -- if the match went to penalties -- a "
+        "separate shootout summary with its own running score."
     )
     Input = XGTimelineInput
 
     def _run(self, match: Match, inputs: XGTimelineInput) -> ToolResult:  # type: ignore[override]
-        shots = self._collect_shots(match, include_shootout=inputs.include_shootout)
+        shots = self._collect_shots(match)
 
         # Preserve a stable team order: teams from the lineups first (so a team
         # that never shot still appears), then any others seen in the shots.
@@ -96,7 +103,10 @@ class XGTimelineTool(Tool):
         for t in teams:
             totals[t] = round(running[t], 4)
 
-        summary = self._summarize(teams, totals, counts, last_minute, inputs)
+        # The shootout, if any, is its own separate contest.
+        shootout = self._collect_shootout(match)
+
+        summary = self._summarize(teams, totals, counts, last_minute, shootout)
 
         data: Dict[str, Any] = {
             "teams": teams,
@@ -104,9 +114,10 @@ class XGTimelineTool(Tool):
             "cumulative_xg": cumulative,
             "total_xg": totals,
             "shot_count": counts,
-            "include_shootout": inputs.include_shootout,
             "bin_minutes": inputs.bin_minutes,
             "shots": shots,
+            # Kept deliberately separate from the run-of-play timeline above.
+            "shootout": shootout,
         }
         return ToolResult(
             tool=self.name,
@@ -116,13 +127,17 @@ class XGTimelineTool(Tool):
         )
 
     @staticmethod
-    def _collect_shots(match: Match, include_shootout: bool) -> List[Dict[str, Any]]:
-        """Extract the shot events we care about, sorted chronologically."""
+    def _collect_shots(match: Match) -> List[Dict[str, Any]]:
+        """Extract the run-of-play shot events, sorted chronologically.
+
+        Excludes the penalty shootout (period 5); in-game penalties are kept,
+        as they are genuine run-of-play chances.
+        """
         shots: List[Dict[str, Any]] = []
         for e in match.events:
             if e.get("type", {}).get("name") != "Shot":
                 continue
-            if not include_shootout and e.get("period") == _SHOOTOUT_PERIOD:
+            if e.get("period") == _SHOOTOUT_PERIOD:
                 continue
             shot = e.get("shot", {})
             xg = shot.get("statsbomb_xg")
@@ -145,21 +160,96 @@ class XGTimelineTool(Tool):
         return shots
 
     @staticmethod
+    def _collect_shootout(match: Match) -> Optional[Dict[str, Any]]:
+        """Summarize the penalty shootout as its own contest, or ``None``.
+
+        A shootout's momentum is the running score, not xG: every kick carries
+        the same flat placeholder xG, so a cumulative-xG view of it is
+        meaningless. We report the ordered kicks with a running goal tally,
+        the final score, and the winner -- a self-contained "new game".
+        """
+        kicks_raw = [
+            e
+            for e in match.events
+            if e.get("type", {}).get("name") == "Shot"
+            and e.get("period") == _SHOOTOUT_PERIOD
+        ]
+        if not kicks_raw:
+            return None
+
+        kicks_raw.sort(key=lambda e: (e.get("minute", 0), e.get("second", 0), e.get("index", 0)))
+
+        # Kicking order = order teams first appear in the sequence.
+        order: List[str] = []
+        for e in kicks_raw:
+            name = e.get("team", {}).get("name", "?")
+            if name not in order:
+                order.append(name)
+
+        score: Dict[str, int] = {t: 0 for t in order}
+        kicks: List[Dict[str, Any]] = []
+        for i, e in enumerate(kicks_raw, start=1):
+            team = e.get("team", {}).get("name", "?")
+            outcome = e.get("shot", {}).get("outcome", {}).get("name")
+            scored = outcome == "Goal"
+            if scored:
+                score[team] += 1
+            kicks.append(
+                {
+                    "index": i,
+                    "team": team,
+                    "player": e.get("player", {}).get("name"),
+                    "outcome": outcome,
+                    "scored": scored,
+                    # Running score after this kick -- the shootout's own momentum.
+                    "score": dict(score),
+                }
+            )
+
+        # A shootout does not end level; guard anyway.
+        winner: Optional[str] = None
+        best = max(score.values())
+        leaders = [t for t, v in score.items() if v == best]
+        if len(leaders) == 1:
+            winner = leaders[0]
+
+        return {
+            "present": True,
+            "order": order,
+            "kicks": kicks,
+            "score": score,
+            "winner": winner,
+            "note": (
+                "Penalty shootout: a separate contest, excluded from the "
+                "run-of-play xG timeline. Its momentum is the running score, "
+                "not xG (shootout xG is a flat placeholder)."
+            ),
+        }
+
+    @staticmethod
     def _summarize(
         teams: List[str],
         totals: Dict[str, float],
         counts: Dict[str, int],
         last_minute: int,
-        inputs: XGTimelineInput,
+        shootout: Optional[Dict[str, Any]],
     ) -> str:
-        parts = [
-            f"{t} {totals[t]:.2f} xG ({counts[t]} shots)" for t in teams
-        ]
-        note = "" if inputs.include_shootout else ", shootout excluded"
-        return (
-            "Cumulative xG through minute "
-            f"{last_minute}: " + " vs ".join(parts) + note + "."
+        parts = [f"{t} {totals[t]:.2f} xG ({counts[t]} shots)" for t in teams]
+        line = (
+            "Cumulative run-of-play xG through minute "
+            f"{last_minute}: " + " vs ".join(parts) + "."
         )
+        if shootout is not None:
+            score = shootout["score"]
+            score_str = "-".join(str(score[t]) for t in shootout["order"])
+            winner = shootout["winner"]
+            tag = f", {winner} won" if winner else ""
+            line += (
+                " Shootout (separate): "
+                + " ".join(f"{t} {score[t]}" for t in shootout["order"])
+                + f" ({score_str}{tag})."
+            )
+        return line
 
 
 # Register on the default REGISTRY at import time.
